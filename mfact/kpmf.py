@@ -4,110 +4,121 @@ from torch.nn.parameter import Parameter
 import torch.nn as nn
 import numpy as np
 
-class KPMF(nn.Module):
+class FactorModel(nn.Module):
 
-    def __init__(self, rank, sigma, K_U, K_V):
-        super(KPMF, self).__init__()
+    def __init__(self, n_rows, n_cols, rank):
+        super(FactorModel, self).__init__()
+        self.rank = rank
+        self.n_rows = n_rows
+        self.n_cols = n_cols
+        self.U = nn.Embedding(self.n_rows, rank)
+        self.V = nn.Embedding(self.n_cols, rank)
+        stdv = torch.rsqrt(torch.Tensor([self.rank]))[0]
+        self.U._parameters['weight'].data.uniform_(-stdv, stdv)
+        self.V._parameters['weight'].data.uniform_(-stdv, stdv)
+
+
+    def forward(self, row_ids, col_ids):
+        rows = self.U(row_ids)
+        cols = self.V(col_ids)
+        return torch.sum(rows * cols, dim=2).squeeze()
+
+
+class KPMFLoss(nn.Module):
+
+    def __init__(self, sigma, K_U, K_V):
+        super(KPMFLoss, self).__init__()
         self.K_U = K_U
         self.K_V = K_V
         self.S_U = K_U.inverse()
         self.S_V = K_V.inverse()
-        self.rank = rank
-        self.n_rows = K_U.size()[0]
-        self.n_cols = K_V.size()[0]
-        self.U = Parameter(torch.Tensor(self.n_rows, rank))
-        self.V = Parameter(torch.Tensor(rank, self.n_cols))
         self.sigma = Parameter(torch.Tensor([sigma]))
-        self.reset_parameters()
 
-    def reset_parameters(self):
-        stdv = torch.rsqrt(torch.Tensor([self.rank]))[0]
-        self.U.data.uniform_(-stdv, stdv)
-        self.V.data.uniform_(-stdv, stdv)
-
-    def forward(self, target):
-        E = Variable(torch.Tensor([0.0]))
-        for t, ind in target:
-            i, j = ind
-            u = self.U[i, :].view(1, self.rank)
-            v = self.V[:, j].unsqueeze(1)
-            E = E + (t - torch.mm(u, v)) ** 2
-        E /= (self.sigma ** 2 * 2.0)
-        for ud in self.U.split(1, dim=1):
-            E += 0.5 * (ud.t().mm(self.S_U)).mm(ud)
-        for vd in self.V.t().split(1, dim=1):
-            E += 0.5 * (vd.t().mm(self.S_V)).mm(vd)
-        E += len(target) * torch.log(self.sigma ** 2)
-        return E
-
-    def get_trainable_parameters(self):
-        return (p for p in self.parameters())
+    def forward(self, preds, targets, U, V):
+        se = torch.sum((preds - targets) ** 2)
+        se = se / self.sigma ** 2 / 2.0
+        U_loss = U.t() @ self.S_U
+        U_loss = 0.5 * torch.sum(U_loss * U.t())
+        V_loss = V.t() @ self.S_V
+        V_loss = 0.5 * torch.sum(V_loss * V.t())
+        return se + U_loss + V_loss
 
 
-
-class KPMFTrainer(object):
+class KPMF(object):
 
     def __init__(self, rank, K_U, K_V, sigma=0.1, lr=0.1):
-        super(KPMFTrainer, self).__init__()
-        self.model = KPMF(rank, sigma, K_U, K_V)
-        self.U_optimizer = torch.optim.SGD([self.model.U], lr=lr)
-        self.V_optimizer = torch.optim.SGD([self.model.V], lr=lr)
+        super(KPMF, self).__init__()
+        n_rows = K_U.size()[0]
+        n_cols = K_V.size()[0]
+        self.lr = lr
+        self.model = FactorModel(n_rows, n_cols, rank)
+        self.loss_function = KPMFLoss(sigma, K_U, K_V)
+        self.U_optimizer = torch.optim.SGD([self.model.U._parameters['weight']], lr=lr)
+        self.V_optimizer = torch.optim.SGD([self.model.V._parameters['weight']], lr=lr)
 
+    def predict(self, rows, cols):
+        return self.model(rows, cols)
 
-    def predict(self):
-        # add ability to do just one item
-        return self.model.U.mm(self.model.V)
+    def RMSE(self, rows, cols, targets):
+        preds = self.predict(rows, cols)
+        n = len(rows)
+        return torch.sqrt(torch.sum((preds - targets) ** 2) / n)
 
-    def RMSE(self, targets):
-        SE = 0.0
-        n = len(targets)
-        for t, ind in targets:
-            i, j = ind
-            u = self.model.U[i, :].view(1, self.model.rank)
-            v = self.model.V[:, j].unsqueeze(1)
-            SE += ((t - torch.mm(u, v)) ** 2)
-        return torch.sqrt(SE / n)
-
-    def train(self, train_data, val_data, batch_size, min_its, max_its, early=True):
-        # Memory, more sophisticated termination criteria
-        # everything able to be CUDAed
+    def fit(self, train_data, val_data, batch_size, min_its, max_its, early=True):
         self.history = {
             'loss': [],
             'train_SE': [],
             'valid_SE': []
         }
-        n = len(train_data)
-        inds = np.arange(len(train_data))
+        rows_t, cols_t, tars_t = train_data
+        rows_v, cols_v, tars_v = val_data
+        n = len(tars_t)
+        inds = np.arange(n)
         batches = int(np.ceil(n / batch_size))
 
         for it in range(max_its):
             np.random.shuffle(inds)
+            total_loss = 0
             for idx in range(batches):
                 if idx == batches - 1:
                     batch_idxs = inds[idx * batch_size:]
                 else:
                     batch_idxs = inds[idx * batch_size: (idx + 1) * batch_size]
-                loss = self.train_batch([train_data[i] for i in batch_idxs])
-            self.history['loss'].append(self.model(train_data).data.numpy()[0][0])
-            self.history['train_SE'].append(self.RMSE(train_data).data.numpy()[0][0])
-            self.history['valid_SE'].append(self.RMSE(val_data).data.numpy()[0][0])
+                batch_idxs = torch.LongTensor(batch_idxs)
+                rows_b = rows_t[batch_idxs]
+                cols_b = cols_t[batch_idxs]
+                tars_b = tars_t[batch_idxs]
+                loss = self.train_batch((rows_b, cols_b, tars_b))
+                total_loss += loss.data.numpy()[0]
+            self.history['loss'].append(total_loss / batches)
+            self.history['train_SE'].append(
+                self.RMSE(rows_t, cols_t, tars_t).data.numpy()[0])
+            self.history['valid_SE'].append(
+                self.RMSE(rows_v, cols_v, tars_v).data.numpy()[0])
 
             print('\rIteration %d\tloss = %.4f\ttrain SE = %.3f\tvalid SE = %.3f'
                   %(it+1, self.history['loss'][-1], self.history['train_SE'][-1],
                     self.history['valid_SE'][-1]),
                  end='')
-            if early and it > min_its and self.history['valid_SE'][-1] > self.history['valid_SE'][-2]:
-                print('\nTerminating based on validation')
-                break
+            if early:
+                if it > min_its:
+                    if self.history['valid_SE'][-1] > self.history['valid_SE'][-2]:
+                        print('\nTerminating based on validation')
+                        break
         return self.history
 
     def train_batch(self, train_data):
+        rows, cols, targets = train_data
         self.U_optimizer.zero_grad()
-        loss = self.model(train_data)
-        loss.backward(retain_graph=True)
+        preds = self.model(rows, cols)
+        L = self.loss_function(preds, targets, self.model.U._parameters['weight'],
+                      self.model.V._parameters['weight'])
+        L.backward(retain_graph=True)
         self.U_optimizer.step()
         self.V_optimizer.zero_grad()
-        loss = self.model(train_data)
-        loss.backward(retain_graph=True)
+        preds = self.model(rows, cols)
+        L = self.loss_function(preds, targets, self.model.U._parameters['weight'],
+                      self.model.V._parameters['weight'])
         self.V_optimizer.step()
-        return loss
+        return L
+        
