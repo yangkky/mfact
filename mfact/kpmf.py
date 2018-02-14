@@ -54,7 +54,6 @@ class KPMFLoss(nn.Module):
         se = se / self.sigma ** 2 / 2.0
         U_loss = U.t() @ self.S_U
         U_loss = 0.5 * torch.sum(U_loss.t() * U)
-        print("U_loss2")
         V_loss = V.t() @ self.S_V
         V_loss = 0.5 * torch.sum(V_loss.t() * V)
         return (se, U_loss, V_loss)
