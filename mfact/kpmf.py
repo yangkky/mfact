@@ -4,6 +4,21 @@ from torch.nn.parameter import Parameter
 import torch.nn as nn
 import numpy as np
 
+class SEKernel(nn.Module):
+    
+    def __init__(self, ell=1.0, sigma=1.0):
+        super(SEKernel, self).__init__()
+        self.ell = Parameter(torch.Tensor([ell]))
+        self.sigma = Parameter(torch.Tensor([sigma]))
+        
+    def forward(self, X1, X2, inds=None):
+        A = torch.sum(X1 ** 2, dim=1, keepdim=True)
+        B = torch.sum(X2 ** 2, dim=1, keepdim=True)
+        B = torch.t(B)
+        C = 2 * torch.matmul(X1, torch.t(X2))
+        D = A + B - C
+        return self.sigma ** 2 * torch.exp(-0.5 * D / self.ell ** 2)  
+    
 class FactorModel(nn.Module):
 
     def __init__(self, n_rows, n_cols, rank):
@@ -38,10 +53,11 @@ class KPMFLoss(nn.Module):
         se = torch.sum((preds - targets) ** 2)
         se = se / self.sigma ** 2 / 2.0
         U_loss = U.t() @ self.S_U
-        U_loss = 0.5 * torch.sum(U_loss * U.t())
+        U_loss = 0.5 * torch.sum(U_loss.t() * U)
+        print("U_loss2")
         V_loss = V.t() @ self.S_V
-        V_loss = 0.5 * torch.sum(V_loss * V.t())
-        return se + U_loss + V_loss
+        V_loss = 0.5 * torch.sum(V_loss.t() * V)
+        return (se, U_loss, V_loss)
 
 
 class KPMF(object):
@@ -121,4 +137,3 @@ class KPMF(object):
                       self.model.V._parameters['weight'])
         self.V_optimizer.step()
         return L
-        
