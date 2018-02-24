@@ -4,21 +4,23 @@ from torch.nn.parameter import Parameter
 import torch.nn as nn
 import numpy as np
 
+
 class SEKernel(nn.Module):
-    
+
     def __init__(self, ell=1.0, sigma=1.0):
         super(SEKernel, self).__init__()
         self.ell = Parameter(torch.Tensor([ell]))
         self.sigma = Parameter(torch.Tensor([sigma]))
-        
+
     def forward(self, X1, X2, inds=None):
         A = torch.sum(X1 ** 2, dim=1, keepdim=True)
         B = torch.sum(X2 ** 2, dim=1, keepdim=True)
         B = torch.t(B)
         C = 2 * torch.matmul(X1, torch.t(X2))
         D = A + B - C
-        return self.sigma ** 2 * torch.exp(-0.5 * D / self.ell ** 2)  
-    
+        return self.sigma ** 2 * torch.exp(-0.5 * D / self.ell ** 2)
+
+
 class FactorModel(nn.Module):
 
     def __init__(self, n_rows, n_cols, rank):
@@ -28,7 +30,7 @@ class FactorModel(nn.Module):
         self.n_cols = n_cols
         self.U = nn.Embedding(self.n_rows, rank)
         self.V = nn.Embedding(self.n_cols, rank)
-        stdv = torch.rsqrt(torch.Tensor([self.rank]))[0]
+        stdv = torch.rsqrt(torch.Tensor([self.rank]))[0] * 2
         self.U._parameters['weight'].data.uniform_(-stdv, stdv)
         self.V._parameters['weight'].data.uniform_(-stdv, stdv)
 
@@ -39,17 +41,39 @@ class FactorModel(nn.Module):
         return torch.sum(rows * cols, dim=2).squeeze()
 
 
+class DeepFactorModel(FactorModel):
+
+    def __init__(self, n_rows, n_cols, rank, hidden_sizes, non_linear):
+        super(DeepFactorModel, self).__init__(n_rows, n_cols, rank)
+        self.non_linear = non_linear
+        hidden_sizes = [2 * rank] + hidden_sizes
+        self.stack = [nn.Linear(prev, curr) for prev, curr
+                      in zip(hidden_sizes[:-1], hidden_sizes[1:])]
+        self.last_layer = nn.Linear(self.stack[-1].weight.size()[0], 1)
+
+    def forward(self, rows_ids, col_ids):
+        rows = self.U(rows_ids)
+        cols = self.V(col_ids)
+        h = torch.cat([rows, cols], dim=-1)
+        for layer in self.stack:
+            h = layer(h)
+            h = self.non_linear(h)
+        h = self.last_layer(h)
+        return h.squeeze()
+
+
 class KPMFLoss(nn.Module):
 
-    def __init__(self, sigma, K_U, K_V):
+    def __init__(self, lambdas, K_U, K_V):
         super(KPMFLoss, self).__init__()
         self.K_U = K_U
         self.K_V = K_V
         self.S_U = K_U.inverse()
         self.S_V = K_V.inverse()
-        self.sigma = Parameter(torch.Tensor([sigma]))
+        self.lambdas = lambdas
 
     def forward(self, preds, targets, U, V):
+<<<<<<< HEAD
         se = torch.sum((preds - targets) ** 2)
         se = se / self.sigma ** 2 / 2.0
         U_loss = U.t() @ self.S_U
@@ -57,17 +81,29 @@ class KPMFLoss(nn.Module):
         V_loss = V.t() @ self.S_V
         V_loss = 0.5 * torch.sum(V_loss.t() * V)
         return (se, U_loss, V_loss)
+=======
+        se, U_loss, V_loss = self.parts(preds, targets, U, V)
+        return se + U_loss + V_loss
+>>>>>>> Add deep matrix factorization.
 
+    def parts(self, preds, targets, U, V):
+        n = len(preds)
+        se = torch.sum((preds - targets) ** 2) / n * self.lambdas[0]
+        U_loss = U.t() @ self.S_U
+        U_loss = torch.sum(U_loss.t() * U) * self.lambdas[1]
+        V_loss = V.t() @ self.S_V
+        V_loss = torch.sum(V_loss.t() * V) * self.lambdas[2]
+        return se, U_loss, V_loss
 
 class KPMF(object):
 
-    def __init__(self, rank, K_U, K_V, sigma=0.1, lr=0.1):
+    def __init__(self, rank, K_U, K_V, lambdas, lr=0.1):
         super(KPMF, self).__init__()
         n_rows = K_U.size()[0]
         n_cols = K_V.size()[0]
         self.lr = lr
         self.model = FactorModel(n_rows, n_cols, rank)
-        self.loss_function = KPMFLoss(sigma, K_U, K_V)
+        self.loss_function = KPMFLoss(lambdas, K_U, K_V)
         self.U_optimizer = torch.optim.SGD([self.model.U._parameters['weight']], lr=lr)
         self.V_optimizer = torch.optim.SGD([self.model.V._parameters['weight']], lr=lr)
 
@@ -78,6 +114,13 @@ class KPMF(object):
         preds = self.predict(rows, cols)
         n = len(rows)
         return torch.sqrt(torch.sum((preds - targets) ** 2) / n)
+
+    def parts(self, rows, cols, targets):
+        preds = self.model(rows, cols)
+        se = torch.sum((preds - targets) ** 2) / len(preds)
+        U = self.model.U._parameters['weight']
+        V = self.model.V._parameters['weight']
+        return self.loss_function.parts(preds, targets, U, V)
 
     def fit(self, train_data, val_data, batch_size, min_its, max_its, early=True):
         self.history = {
@@ -105,7 +148,11 @@ class KPMF(object):
                 tars_b = tars_t[batch_idxs]
                 loss = self.train_batch((rows_b, cols_b, tars_b))
                 total_loss += loss.data.numpy()[0]
-            self.history['loss'].append(total_loss / batches)
+            preds = self.predict(rows_t, cols_t)
+            total_loss = self.loss_function(preds, tars_t,
+                                            self.model.U._parameters['weight'],
+                                            self.model.V._parameters['weight'])
+            self.history['loss'].append(total_loss.data.numpy()[0])
             self.history['train_SE'].append(
                 self.RMSE(rows_t, cols_t, tars_t).data.numpy()[0])
             self.history['valid_SE'].append(
@@ -124,15 +171,41 @@ class KPMF(object):
 
     def train_batch(self, train_data):
         rows, cols, targets = train_data
+
         self.U_optimizer.zero_grad()
         preds = self.model(rows, cols)
         L = self.loss_function(preds, targets, self.model.U._parameters['weight'],
                       self.model.V._parameters['weight'])
-        L.backward(retain_graph=True)
+        L.backward()
         self.U_optimizer.step()
+
         self.V_optimizer.zero_grad()
         preds = self.model(rows, cols)
         L = self.loss_function(preds, targets, self.model.U._parameters['weight'],
                       self.model.V._parameters['weight'])
+        L.backward()
         self.V_optimizer.step()
         return L
+<<<<<<< HEAD
+=======
+
+class DeepKPMF(KPMF):
+
+    def __init__(self, rank, K_U, K_V,  hidden_sizes, non_linear, lambdas, lr=0.1):
+        n_rows = K_U.size()[0]
+        n_cols = K_V.size()[0]
+        self.lr = lr
+        self.model = DeepFactorModel(n_rows, n_cols, rank, hidden_sizes, non_linear)
+        self.loss_function = KPMFLoss(lambdas, K_U, K_V)
+        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=lr)
+
+    def train_batch(self, train_data):
+        rows, cols, targets = train_data
+        self.optimizer.zero_grad()
+        preds = self.model(rows, cols)
+        L = self.loss_function(preds, targets, self.model.U._parameters['weight'],
+                      self.model.V._parameters['weight'])
+        L.backward(retain_graph=True)
+        self.optimizer.step()
+        return L
+>>>>>>> Add deep matrix factorization.
