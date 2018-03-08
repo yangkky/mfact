@@ -73,18 +73,8 @@ class KPMFLoss(nn.Module):
         self.lambdas = lambdas
 
     def forward(self, preds, targets, U, V):
-<<<<<<< HEAD
-        se = torch.sum((preds - targets) ** 2)
-        se = se / self.sigma ** 2 / 2.0
-        U_loss = U.t() @ self.S_U
-        U_loss = 0.5 * torch.sum(U_loss.t() * U)
-        V_loss = V.t() @ self.S_V
-        V_loss = 0.5 * torch.sum(V_loss.t() * V)
-        return (se, U_loss, V_loss)
-=======
         se, U_loss, V_loss = self.parts(preds, targets, U, V)
         return se + U_loss + V_loss
->>>>>>> Add deep matrix factorization.
 
     def parts(self, preds, targets, U, V):
         n = len(preds)
@@ -186,8 +176,7 @@ class KPMF(object):
         L.backward()
         self.V_optimizer.step()
         return L
-<<<<<<< HEAD
-=======
+
 
 class DeepKPMF(KPMF):
 
@@ -208,4 +197,3 @@ class DeepKPMF(KPMF):
         L.backward(retain_graph=True)
         self.optimizer.step()
         return L
->>>>>>> Add deep matrix factorization.
