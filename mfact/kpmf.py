@@ -43,21 +43,25 @@ class FactorModel(nn.Module):
 
 class DeepFactorModel(FactorModel):
 
-    def __init__(self, n_rows, n_cols, rank, hidden_sizes, non_linear):
+    def __init__(self, n_rows, n_cols, rank, hidden_sizes, non_linear, dropout=0.1):
         super(DeepFactorModel, self).__init__(n_rows, n_cols, rank)
         self.non_linear = non_linear
         hidden_sizes = [2 * rank] + hidden_sizes
         self.stack = [nn.Linear(prev, curr) for prev, curr
                       in zip(hidden_sizes[:-1], hidden_sizes[1:])]
+        self.stack = nn.ModuleList(self.stack)
         self.last_layer = nn.Linear(self.stack[-1].weight.size()[0], 1)
+        self.dropout = nn.Dropout(p=dropout)
 
     def forward(self, rows_ids, col_ids):
         rows = self.U(rows_ids)
         cols = self.V(col_ids)
         h = torch.cat([rows, cols], dim=-1)
+        h = self.dropout(h)
         for layer in self.stack:
             h = layer(h)
             h = self.non_linear(h)
+            h = self.dropout(h)
         h = self.last_layer(h)
         return h.squeeze()
 
