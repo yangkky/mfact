@@ -41,12 +41,19 @@ class FactorModel(nn.Module):
         return torch.sum(rows * cols, dim=2).squeeze()
 
 
-class DeepFactorModel(FactorModel):
+class DeepFactorModel(nn.Module):
 
-    def __init__(self, n_rows, n_cols, rank, hidden_sizes, non_linear, dropout=0.1):
-        super(DeepFactorModel, self).__init__(n_rows, n_cols, rank)
+    def __init__(self, n_rows, n_cols, row_rank, col_rank,
+                 hidden_sizes, non_linear, dropout=0.1):
+        super(DeepFactorModel, self).__init__()
+        self.row_rank = row_rank
+        self.col_rank = col_rank
+        self.n_rows = n_rows
+        self.n_cols = n_cols
+        self.U = nn.Embedding(self.n_rows, row_rank)
+        self.V = nn.Embedding(self.n_cols, col_rank)
         self.non_linear = non_linear
-        hidden_sizes = [2 * rank] + hidden_sizes
+        hidden_sizes = [row_rank + col_rank] + hidden_sizes
         self.stack = [nn.Linear(prev, curr) for prev, curr
                       in zip(hidden_sizes[:-1], hidden_sizes[1:])]
         self.stack = nn.ModuleList(self.stack)
@@ -104,19 +111,18 @@ class KPMF(object):
     def predict(self, rows, cols):
         return self.model(rows, cols)
 
-    def RMSE(self, rows, cols, targets):
+    def MSE(self, rows, cols, targets):
         preds = self.predict(rows, cols)
         n = len(rows)
-        return torch.sqrt(torch.sum((preds - targets) ** 2) / n)
+        return torch.sum((preds - targets) ** 2) / n
 
     def parts(self, rows, cols, targets):
         preds = self.model(rows, cols)
-        se = torch.sum((preds - targets) ** 2) / len(preds)
         U = self.model.U._parameters['weight']
         V = self.model.V._parameters['weight']
         return self.loss_function.parts(preds, targets, U, V)
 
-    def fit(self, train_data, val_data, batch_size, min_its, max_its, early=True):
+    def fit(self, train_data, val_data, batch_size, min_its, max_its, patience=np.inf):
         self.history = {
             'loss': [],
             'train_SE': [],
@@ -131,6 +137,8 @@ class KPMF(object):
         for it in range(max_its):
             np.random.shuffle(inds)
             total_loss = 0
+            total_n = 0
+            total_mse = 0
             for idx in range(batches):
                 if idx == batches - 1:
                     batch_idxs = inds[idx * batch_size:]
@@ -140,27 +148,33 @@ class KPMF(object):
                 rows_b = rows_t[batch_idxs]
                 cols_b = cols_t[batch_idxs]
                 tars_b = tars_t[batch_idxs]
-                loss = self.train_batch((rows_b, cols_b, tars_b))
-                total_loss += loss.data.numpy()[0]
-            preds = self.predict(rows_t, cols_t)
-            total_loss = self.loss_function(preds, tars_t,
-                                            self.model.U._parameters['weight'],
-                                            self.model.V._parameters['weight'])
-            self.history['loss'].append(total_loss.data.numpy()[0])
-            self.history['train_SE'].append(
-                self.RMSE(rows_t, cols_t, tars_t).data.numpy()[0])
+                self.model.train()
+                loss, mse = self.train_batch((rows_b, cols_b, tars_b))
+                total_loss += loss.cpu().data.numpy()[0] * len(batch_idxs)
+                total_n += len(batch_idxs)
+                total_mse += mse.cpu().data.numpy()[0] * len(batch_idxs)
+            self.history['loss'].append(total_loss / total_n)
+            self.history['train_SE'].append(total_mse / total_n)
+            self.model.eval()
             self.history['valid_SE'].append(
-                self.RMSE(rows_v, cols_v, tars_v).data.numpy()[0])
+                self.MSE(rows_v, cols_v, tars_v).data.numpy()[0])
 
-            print('\rIteration %d\tloss = %.4f\ttrain SE = %.3f\tvalid SE = %.3f'
+            # Save checkpoint
+            if np.argmin(self.history['valid_SE']) == it:
+                torch.save(self.model.state_dict(), 'tmp.chkpt.pkl')
+
+
+            print('\rEpoch %d\tloss = %.4f\ttrain SE = %.3f\tvalid SE = %.3f'
                   %(it+1, self.history['loss'][-1], self.history['train_SE'][-1],
                     self.history['valid_SE'][-1]),
                  end='')
-            if early:
+            if len(self.history['valid_SE']) - np.argmin(self.history['valid_SE']) > patience:
                 if it > min_its:
-                    if self.history['valid_SE'][-1] > self.history['valid_SE'][-2]:
-                        print('\nTerminating based on validation')
-                        break
+                    print('\nTerminating based on validation')
+                    break
+        # Set model to best parameters
+        self.model.load_state_dict(torch.load('tmp.chkpt.pkl'))
+
         return self.history
 
     def train_batch(self, train_data):
@@ -179,18 +193,24 @@ class KPMF(object):
                       self.model.V._parameters['weight'])
         L.backward()
         self.V_optimizer.step()
-        return L
+        n = len(targets)
+        mse = torch.sum((preds - targets) ** 2) / n
+        return L, mse
 
 
 class DeepKPMF(KPMF):
 
-    def __init__(self, rank, K_U, K_V,  hidden_sizes, non_linear, lambdas, lr=0.1):
+    def __init__(self, row_rank, col_rank, K_U, K_V, hidden_sizes, non_linear,
+                 lambdas, lr=0.1, dropout=0.1, steps=50, factor=0.8):
         n_rows = K_U.size()[0]
         n_cols = K_V.size()[0]
         self.lr = lr
-        self.model = DeepFactorModel(n_rows, n_cols, rank, hidden_sizes, non_linear)
+        self.model = DeepFactorModel(n_rows, n_cols, row_rank, col_rank,
+                                     hidden_sizes, non_linear, dropout=dropout)
         self.loss_function = KPMFLoss(lambdas, K_U, K_V)
-        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=lr)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer,
+                                                         steps, factor)
 
     def train_batch(self, train_data):
         rows, cols, targets = train_data
@@ -199,5 +219,8 @@ class DeepKPMF(KPMF):
         L = self.loss_function(preds, targets, self.model.U._parameters['weight'],
                       self.model.V._parameters['weight'])
         L.backward(retain_graph=True)
+        self.scheduler.step()
         self.optimizer.step()
-        return L
+        n = len(targets)
+        mse = torch.sum((preds - targets) ** 2) / n
+        return L, mse
